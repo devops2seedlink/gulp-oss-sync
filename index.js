@@ -9,9 +9,12 @@ const through = require('through2');
 const crypto = require('crypto');
 const mime = require('mime');
 const gutil = require('gulp-util');
-const Spinner = require('cli-spinner').Spinner;
+const Vinyl = require('vinyl');
+const Stream = require('stream');
+const path = require('path');
+const reporter = require('./log-reporter');
 
-var PLUGIN_NAME = 'gulp-oss-sync';
+let PLUGIN_NAME = 'gulp-oss-sync';
 
 /**
  * calculate file hash
@@ -37,8 +40,8 @@ function md5Hash (buf) {
  */
 
 function getContentType (file) {
-  var mimeType = mime.lookup(file.unzipPath || file.path);
-  var charset = mime.charsets.lookup(mimeType);
+  let mimeType = mime.lookup(file.unzipPath || file.path);
+  let charset = mime.charsets.lookup(mimeType);
 
   return charset
     ? mimeType + '; charset=' + charset.toLowerCase()
@@ -53,60 +56,100 @@ function getContentType (file) {
  * @api private
  */
 
-function initFile (file) {
+function initFile (file, prefix) {
   if (!file.oss) {
     file.oss = {};
     file.oss.headers = {};
-    file.oss.path = file.relative.replace(/\\/g, '/');
+    file.oss.path = path.join(prefix, file.relative.replace(/\\/g, '/'));
   }
   return file;
 }
 
-function saveCache (cache, filename) {
-  fs.writeFileSync(filename, JSON.stringify(cache));
-}
+/**
+ * create a through stream that print oss status info
+ * @param {Object} param parameter to pass to logger
+ *
+ * @return {Stream}
+ * @api public
+ */
 
-function report (newCache, oldCache) {
-  const s = {
-    new: '[newfile]',
-    ign: '[ignored]',
-    rep: '[replace]',
-    del: '[deleted]'
-  };
-  const count = {
-    new: 0,
-    ign: 0,
-    rep: 0,
-    del: 0
-  };
-  Object.keys(newCache).forEach(function (path) {
-    let state;
-    if (!oldCache.hasOwnProperty(path)) {
-      state = gutil.colors.green(s.new);
-      count.new++;
-    } else if (oldCache[path] === newCache[path]) {
-      state = gutil.colors.grey(s.ign);
-      count.ign++;
+module.exports.reporter = function(param) {
+  return reporter(param);
+};
+
+/**
+ * create a through stream that save file in cache
+ *
+ * @return {Stream}
+ * @api public
+ */
+
+Publisher.prototype.cache = function() {
+  let _this = this,
+      counter = 0;
+
+  function saveCache() {
+    fs.writeFileSync(_this.getCacheFilename(), JSON.stringify(_this._cache));
+  }
+
+  let stream = through.obj(function (file, enc, cb) {
+    if (file.oss && file.oss.path) {
+
+      // do nothing for file already cached
+      if (file.oss.state === 'cache') return cb(null, file);
+
+      // remove deleted
+      if (file.oss.state === 'delete') {
+        delete _this._cache[file.oss.path];
+
+      // update others
+      } else if (file.oss.etag) {
+        _this._cache[file.oss.path] = file.oss.etag;
+      }
+
+      // save cache every 10 files
+      if (++counter % 10) saveCache();
+    }
+
+    cb(null, file);
+  });
+
+  stream.on('finish', saveCache);
+
+  return stream;
+};
+
+/**
+ * filter
+ * @param  {String} key filepath
+ * @param  {Array} whitelist list of expressions that match against files that should not be deleted
+ *
+ * @return {Boolean} shouldDelete whether the file should be deleted or not
+ * @api private
+ */
+
+function fileShouldBeDeleted (key, whitelist) {
+  for (let i = 0; i < whitelist.length; i++) {
+    let expr = whitelist[i];
+    if (expr instanceof RegExp) {
+      if (expr.test(key)) {
+        return false;
+      }
+    } else if (typeof expr === 'string') {
+      if (expr === key) {
+        return false;
+      }
     } else {
-      state = gutil.colors.yellow(s.rep);
-      count.rep++;
+      throw new Error('whitelist param can only contain regular expressions or strings');
     }
-    gutil.log(state, path);
-  });
-  Object.keys(oldCache).forEach(function (path) {
-    if (!newCache.hasOwnProperty(path)) {
-      let state = gutil.colors.red(s.del);
-      count.del++;
-      gutil.log(state, path);
-    }
-  });
-  gutil.log(`created: ${gutil.colors.green(count.new)}; ignored: ${gutil.colors.grey(count.ign)}; updated: ${gutil.colors.yellow(count.rep)}; deleted: ${gutil.colors.red(count.del)}`);
+  }
+  return true;
 }
 
 /**
  * create a new Publisher
  * @param {Object} OSS options as per https://help.aliyun.com/document_detail/32070.html
- * @api private
+ * @api public
  */
 
 /**
@@ -120,9 +163,14 @@ function report (newCache, oldCache) {
 
 function Publisher (ossConfig, cacheOptions) {
   this.config = ossConfig;
+  this.setting = this.config.setting || {prefix: '', createOnly: false, force: false, simulate: false, whitelistedFiles: []};
+  this.setting.prefix = !!this.config.setting.prefix ? this.config.setting.prefix : '';
+  this.setting.whitelistedFiles = !!this.config.setting.whitelistedFiles ? this.config.setting.whitelistedFiles : [];
+  this.setting.createOnly = !!this.config.setting.createOnly;
+  this.setting.force = !!this.config.setting.force;
+  this.setting.simulate = !!this.config.setting.simulate;
   this.client = new OSS(ossConfig.connect);
-  this._newCache = {};
-  var bucket = this.config.connect.bucket;
+  let bucket = this.config.connect.bucket;
 
   if (!bucket) {
     throw new Error('Missing `connect.bucket` config value.');
@@ -134,18 +182,10 @@ function Publisher (ossConfig, cacheOptions) {
     : '.oss-cache-' + bucket;
 
   // load cache
-  if (ossConfig.setting.force) {
-    try {
-      fs.unlinkSync(this.getCacheFilename());
-    } catch (err) {} finally {
-      this._oldCache = {};
-    }
-  } else {
-    try {
-      this._oldCache = JSON.parse(fs.readFileSync(this.getCacheFilename(), 'utf8'));
-    } catch (err) {
-      this._oldCache = {};
-    }
+  try {
+    this._cache = JSON.parse(fs.readFileSync(this.getCacheFilename(), 'utf8'));
+  } catch (err) {
+    this._cache = {};
   }
 }
 
@@ -157,6 +197,62 @@ function Publisher (ossConfig, cacheOptions) {
 
 Publisher.prototype.getCacheFilename = function () {
   return this._cacheFile;
+};
+
+/**
+ * Sync file in stream with file in the oss bucket
+ * @param {String} prefix prefix to sync a specific directory
+ * @param {Array} whitelistedFiles list of expressions that match against files that should not be deleted
+ *
+ * @return {Stream} a transform stream that stream both new files and delete files
+ * @api public
+ */
+
+ Publisher.prototype.sync = function() {
+  let client = this.client,
+      prefix = this.config.setting.prefix,
+      whitelistedFiles = this.config.setting.whitelistedFiles,
+      stream = new Stream.Transform({ objectMode : true }),
+      newFiles = {};
+
+  // push file to stream and add files to oss path to list of new files
+  stream._transform = function(file, encoding, cb) {
+    newFiles[file.oss.path] = true;
+    this.push(file);
+    cb();
+  };
+
+  stream._flush = function(cb) {
+    let toDelete = [],
+        lister;
+    co(function* () {
+        lister = yield client.list({ prefix: prefix });
+        let deleteFile;
+        let key;
+        for(let i = 0; i < lister.objects.length; i++) {
+          key = lister.objects[i].name;
+          if (newFiles[key]) continue;
+          if (!fileShouldBeDeleted(key, whitelistedFiles)) continue;
+          deleteFile = new Vinyl({});
+          deleteFile.oss = {
+            path: key,
+            state: 'delete',
+            headers: {}
+          };
+          stream.push(deleteFile);
+          toDelete.push(key);
+        }
+        if(toDelete.length > 0){
+          yield client.deleteMulti(toDelete, {
+            quiet: true
+          });
+        }
+    }).catch(function (err) {
+      cb(err);
+    });
+  };
+
+  return stream;
 };
 
 /**
@@ -172,40 +268,16 @@ Publisher.prototype.getCacheFilename = function () {
  * @api public
  */
 
-Publisher.prototype.push = function () {
+Publisher.prototype.publish = function () {
   const _this = this;
-  const _newCache = _this._newCache;
-  const _oldCache = _this._oldCache;
-  const options = _this.config.setting || {noClean: false, quiet: true, force: false};
-  const storeCache = function () {
-    return saveCache(_newCache, _this.getCacheFilename());
-  };
-  let counter = 0;
-  const spinner = new Spinner('Now publish files ... %s');
-  spinner.setSpinnerString('|/-\\');
-  spinner.start();
 
-  function onFinish () {
-    spinner.stop(true);
-    storeCache();
-    if (!options || options.noClean) return;
-    const objs = Object.keys(_oldCache)
-      .filter(function (path) {
-        return !_newCache.hasOwnProperty(path);
-      })
-      .map(function (path) { return `${_this.config.setting.dir}/${path}`; });
-    if (objs.length > 0) {
-      co(function* () {
-        yield _this.client.deleteMulti(objs, {quiet: options.quiet});
-      }).catch(function (err) {
-        gutil.log('[Cleanup failed]', err);
-      });
-    }
-    report(_newCache, _oldCache);
-  }
+  let options = _this.config.setting;
 
   const stream = through.obj(function (file, enc, cb) {
-    var etag;
+    let etag;
+    let headObj;
+    let noUpdate;
+    let noChange;
 
     // Do nothing if no contents
     if (file.isNull()) return cb();
@@ -219,23 +291,13 @@ Publisher.prototype.push = function () {
 
     // check if file.contents is a `Buffer`
     if (file.isBuffer()) {
-      initFile(file);
+      initFile(file, options.prefix);
 
       // calculate etag
       etag = '"' + md5Hash(file.contents) + '"';
 
-      // set new cache object
-      _newCache[file.oss.path] = etag;
-
-      // check if file is identical as the one in cache
-      if (_this._oldCache[file.oss.path] === etag) {
-        file.oss.state = 'cache';
-        return cb(null, file);
-      } else {
-        file.oss.state = 'upload';
-        file.oss.etag = etag;
-        file.oss.date = new Date();
-      }
+      // delete - stop here
+      if (file.oss.state === 'delete') return cb(null, file);
 
       // add content-type header
       if (!file.oss.headers['Content-Type']) file.oss.headers['Content-Type'] = getContentType(file);
@@ -248,21 +310,38 @@ Publisher.prototype.push = function () {
       const controls = _this.config.controls || {};
       controls.headers = Object.assign({}, controls.headers, file.oss.headers);
       co(function* () {
-        yield _this.client.put(`${_this.config.setting.dir}/${file.oss.path}`, file.contents, controls);
-        if (++counter % 10 === 0) storeCache();
-        cb(null, file);
+        try{
+          //console.log(file.oss.path);
+          headObj = yield _this.client.head(file.oss.path);
+        }catch (err) {
+          //console.log(err);
+          if (err && err.code != 'NoSuchKey'){
+            cb(err, file);
+          }
+        }
+        noUpdate = options.createOnly && headObj && headObj.res && headObj.res.headers.etag;
+        noChange = !options.force && headObj && headObj.res && headObj.res.headers.etag.toLowerCase() === etag.toLowerCase();
+        if (noUpdate || noChange) {
+          file.oss.state = 'skip';
+          file.oss.etag = etag;
+          file.oss.date = new Date(headObj.res.headers['last-modified']);
+          cb(null, file);
+        } else{
+          file.oss.state = headObj && headObj.res && headObj.res.headers.etag ? 'update' : 'create';
+          file.oss.etag = etag;
+          yield _this.client.put(file.oss.path, file.contents, controls);
+          cb(null, file);
+        }
       }).catch(function (err) {
         cb(err, file);
-        spinner.stop(true);
       });
     }
   });
-  stream.on('finish', onFinish);
   return stream;
 };
 
 /**
- * export Publisher.push
+ * export Publisher.create
  *
  * @param {Object} ossConfig
  * @param {Object} cacheOptions
@@ -270,7 +349,6 @@ Publisher.prototype.push = function () {
  *
  * @api public
  */
-module.exports = function (ossConfig, cacheOptions) {
-  const publisher = new Publisher(ossConfig, cacheOptions);
-  return publisher.push();
+exports.create = function (ossConfig, cacheOptions) {
+  return new Publisher(ossConfig, cacheOptions);
 };
